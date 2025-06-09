@@ -1,0 +1,605 @@
+import os
+import json
+import hashlib
+import datetime
+import time
+import pandas as pd
+import shutil
+
+from fastapi import FastAPI, Request, Query, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional, List
+
+from smart_file_loader import (
+    load_all_parquet_tables,
+    get_first_parquet_file_path,
+)
+from progress_manager import ProgressManager
+
+from filelock import FileLock
+
+# --- CONFIGURABLE ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+PER_FILE_MAX = 15000
+TOTAL_MAX = 15000
+BATCH_SIZE = 15000
+
+GDRIVE_FOLDER_ID_CSVJSON = "1nDveh8erKuSFTghCHhlPEEZmu9SUo8jB"
+SERVICE_ACCOUNT_JSON_PATH_CSVJSON = os.path.join(BASE_DIR, "gdrive_service_account_csvjson.json")
+GDRIVE_FOLDER_ID_OTHER = "1Yx_Zeil9xoFPxS6-QZTBpwnhmaE2pSzu"
+SERVICE_ACCOUNT_JSON_PATH_OTHER = os.path.join(BASE_DIR, "gdrive_service_account.json")
+
+META_FILE = os.path.join(DATA_DIR, "csvjson_gdrive_meta.json")
+META_FILES = [
+    os.path.join(DATA_DIR, "csvjson_gdrive_meta.json"),
+    os.path.join(DATA_DIR, "other_gdrive_meta.json"),
+]
+EXCLUDE_FILES = {'file_progress.json', 'csvjson_gdrive_meta.json', 'other_gdrive_meta.json'}
+ALLOWED_STATUS = {"active", "new", "changed", "done"}
+
+pm = ProgressManager(DATA_DIR)
+
+def serialize_for_json(obj):
+    if isinstance(obj, (datetime.date, datetime.datetime)):
+        return obj.isoformat()
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    return str(obj)
+
+def get_valid_meta_files(meta_file=META_FILE, allowed_status=ALLOWED_STATUS):
+    files = []
+    if not os.path.exists(meta_file):
+        return []
+    with open(meta_file, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    for m in meta:
+        fname = m.get("saved_name")
+        status = m.get("status", "")
+        if fname and fname.endswith(".parquet") and not fname.endswith('.parquet.meta.json') and status in allowed_status:
+            files.append(fname)
+    return files
+
+def get_files_with_total(pm, meta_file=META_FILE):
+    files = []
+    valid_files = get_valid_meta_files(meta_file)
+    for fname in valid_files:
+        meta = pm.get_file_progress(fname)
+        total = meta.get("total", 0)
+        processed = meta.get("processed", 0)
+        files.append({"name": fname, "total": total, "processed": processed})
+    files.sort(key=lambda x: x["total"])
+    return files
+
+def ambil_data(file_name, offset, limit):
+    fpath = os.path.join(DATA_DIR, file_name)
+    df = pd.read_parquet(fpath)
+    batch = df.iloc[offset:offset+limit].to_dict(orient="records")
+    return batch
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+def root():
+    print("[DEBUG] root called")
+    return {"message": "FastAPI backend is running!"}
+
+@app.get("/file_row_status")
+def file_row_status(
+    file: Optional[str] = Query(None, description="Nama file (filter)"),
+    is_estimated: Optional[bool] = Query(None, description="True=estimasi, False=real count"),
+):
+    try:
+        progress = pm.get_all_progress()
+        result = []
+        for fname, entry in progress.items():
+            if file and fname != file:
+                continue
+            if is_estimated is not None and entry.get("is_estimated", True) != is_estimated:
+                continue
+            result.append({
+                "file": fname,
+                "total": entry.get("total", 0),
+                "is_estimated": entry.get("is_estimated", True),
+                "processed": entry.get("processed", 0)
+            })
+        return result
+    except Exception as e:
+        print(f"[file_row_status][ERROR] {e}")
+        return []
+
+# --- PATCHED: ADVANCED, ROBUST, AGENTIC /trigger_gdrive_sync ---
+@app.post("/trigger_gdrive_sync")
+async def trigger_gdrive_sync(request: Request):
+    """
+    Menjalankan sinkronisasi meta audit dan meta utama dari GDrive.
+    PATCH: Terima semua argumen body/query, abaikan semua agar n8n tidak error.
+    """
+    from utils_gdrive import trigger_gdrive_sync
+
+    log = []
+    try:
+        _ = await request.json() if request.headers.get("content-type", "").startswith("application/json") else None
+    except Exception:
+        pass
+
+    # Patch: Pass meta_prefix to trigger_gdrive_sync for both folders, log meta_file_main, and advanced error handling
+    try:
+        print("[DEBUG] trigger_gdrive_sync: Syncing csvjson folder")
+        res_csvjson = trigger_gdrive_sync(
+            folder_id=GDRIVE_FOLDER_ID_CSVJSON,
+            data_dir=DATA_DIR,
+            service_account_json_path=SERVICE_ACCOUNT_JSON_PATH_CSVJSON,
+            meta_prefix="csvjson"
+        )
+        log.append(f"Synced csvjson folder: {res_csvjson.get('meta_file_main', '')}")
+    except Exception as e:
+        log.append(f"Failed to sync csvjson: {e}")
+        print(f"[DEBUG] trigger_gdrive_sync: Failed to sync csvjson: {e}")
+    try:
+        print("[DEBUG] trigger_gdrive_sync: Syncing other folder")
+        res_other = trigger_gdrive_sync(
+            folder_id=GDRIVE_FOLDER_ID_OTHER,
+            data_dir=DATA_DIR,
+            service_account_json_path=SERVICE_ACCOUNT_JSON_PATH_OTHER,
+            meta_prefix="other"
+        )
+        log.append(f"Synced other folder: {res_other.get('meta_file_main', '')}")
+    except Exception as e:
+        log.append(f"Failed to sync other: {e}")
+        print(f"[DEBUG] trigger_gdrive_sync: Failed to sync other: {e}")
+    print(f"[DEBUG] trigger_gdrive_sync: log={log}")
+    return JSONResponse({"status": "done", "log": log})
+
+@app.post("/trigger_download_missing_files")
+async def trigger_download_missing_files(request: Request):
+    """
+    Mendownload file dari GDrive untuk entry meta yang status-nya missing_local, new, atau changed.
+    PATCH: Terima semua argumen body/query, abaikan semua agar n8n tidak error.
+    Berjalan untuk semua meta file di META_FILES.
+    """
+    from download_gdrive_files import download_missing_files
+
+    log = []
+    results = []
+    try:
+        _ = await request.json() if request.headers.get("content-type", "").startswith("application/json") else None
+    except Exception:
+        pass
+
+    folder_configs = [
+        {
+            "meta_prefix": "csvjson",
+            "data_dir": DATA_DIR,
+            "service_account_json_path": SERVICE_ACCOUNT_JSON_PATH_CSVJSON,
+        },
+        {
+            "meta_prefix": "other",
+            "data_dir": DATA_DIR,
+            "service_account_json_path": SERVICE_ACCOUNT_JSON_PATH_OTHER,
+        }
+    ]
+    for conf in folder_configs:
+        try:
+            meta_file_path = os.path.join(conf["data_dir"], f"{conf['meta_prefix']}_gdrive_meta.json")
+            res = download_missing_files(
+                data_dir=conf["data_dir"],
+                meta_audit_path=meta_file_path,
+                service_account_json_path=conf["service_account_json_path"]
+            )
+            results.append(res)
+            log.append(f"Downloaded for {conf['meta_prefix']}")
+        except Exception as e:
+            results.append({"error": str(e)})
+            log.append(f"Failed to download for {conf['meta_prefix']}: {e}")
+    return {"status": "done", "log": log, "results": results}
+
+@app.post("/sync_progress")
+def sync_progress():
+    print("[DEBUG] /sync_progress called")
+    pm.sync_progress()
+    print("[DEBUG] /sync_progress finished")
+    return {"status": "synced"}
+
+@app.post("/run_batch_orchestrator")
+def run_batch_orchestrator(background_tasks: BackgroundTasks):
+    print("[DEBUG] /run_batch_orchestrator called")
+    def _run():
+        print("[DEBUG] /run_batch_orchestrator background main_loop start")
+        from agentic_batch_orchestrator import main_loop
+        main_loop()
+        print("[DEBUG] /run_batch_orchestrator background main_loop finished")
+    background_tasks.add_task(_run)
+    return {"status": "started"}
+
+def _detect_file(tname, tdict, data_dir):
+    filename = tdict.get('filename') or tdict.get('file_path') or tdict.get('saved_name') or None
+    if filename and os.path.basename(filename):
+        filename = os.path.basename(filename)
+    else:
+        candidates = []
+        for f in get_valid_meta_files():
+            fname, ext = os.path.splitext(f)
+            if fname == tname or f == tname or f.startswith(tname):
+                candidates.append(f)
+        filename = candidates[0] if candidates else tname
+    print(f"[DEBUG] _detect_file: tname={tname}, detected filename={filename}")
+    return filename
+
+def collect_tabular_data(data_dir, only_table=None, include_progress=True, only_processed=True):
+    print(f"[DEBUG] collect_tabular_data: only_table={only_table}, only_processed={only_processed}")
+    tables_parquet = load_all_parquet_tables(data_dir)
+    print(f"[DEBUG] collect_tabular_data: loaded tables_parquet={list(tables_parquet.keys())}")
+    file_entries = []
+    keys = [only_table] if only_table else list(tables_parquet.keys())
+    for tname in keys:
+        tdict = tables_parquet.get(tname)
+        if not tdict:
+            continue
+        filename = _detect_file(tname, tdict, data_dir)
+        if filename in EXCLUDE_FILES:
+            print(f"[DEBUG] collect_tabular_data: skipping excluded file {filename}")
+            continue
+        data = tdict.get('data', [])
+        if (
+            data
+            and isinstance(data, list)
+            and all(isinstance(row, dict) for row in data)
+        ):
+            fpath = os.path.join(data_dir, filename)
+            try:
+                size_bytes = os.path.getsize(fpath)
+            except Exception as e:
+                print(f"[DEBUG] collect_tabular_data: os.path.getsize failed for {fpath}: {e}")
+                size_bytes = len(json.dumps(data, default=str).encode("utf-8"))
+            file_entries.append((tname, tdict, filename, size_bytes))
+    file_entries = sorted(file_entries, key=lambda x: x[3])
+    merged = []
+    for tname, tdict, filename, _ in file_entries:
+        data = tdict.get('data', [])
+        file_prog = pm.get_file_progress(filename)
+        processed = file_prog.get('processed', 0) if (file_prog and only_processed) else None
+        if processed is not None and processed > 0:
+            filtered_data = data[:processed]
+        elif processed is not None and processed == 0:
+            filtered_data = []
+        else:
+            filtered_data = data
+        for row in filtered_data:
+            row_with_file = dict(row)
+            row_with_file['data_file'] = filename
+            merged.append(row_with_file)
+    print(f"[DEBUG] collect_tabular_data: merged data length={len(merged)}")
+    return merged
+
+def list_all_tables(data_dir):
+    print(f"[DEBUG] list_all_tables called")
+    tables_parquet = load_all_parquet_tables(data_dir)
+    result_tables = list(tables_parquet.keys())
+    print(f"[DEBUG] list_all_tables: result_tables={result_tables}")
+    return result_tables
+
+@app.get("/list_tables")
+def api_list_tables():
+    print("[DEBUG] api_list_tables called")
+    return JSONResponse(content={"tables": list_all_tables(DATA_DIR)})
+
+@app.get("/all_data_merge")
+def api_all_data_merge(
+    limit: int = Query(15000, ge=1, le=100000),
+    offset: int = Query(0, ge=0),
+    table: str = Query(None)
+):
+    print(f"[DEBUG] api_all_data_merge called: limit={limit}, offset={offset}, table={table}")
+    try:
+        merged = collect_tabular_data(DATA_DIR, only_table=table, include_progress=False, only_processed=True)
+        paged_data = merged[offset:offset+limit]
+        print(f"[DEBUG] api_all_data_merge: paged_data length={len(paged_data)}")
+        json_compatible = json.loads(json.dumps(paged_data, default=serialize_for_json))
+        return JSONResponse(content=json_compatible)
+    except Exception as e:
+        print(f"[all_data_merge][ERROR] {e}")
+        return JSONResponse(content=[])
+
+@app.post("/all_data_merge")
+@app.put("/all_data_merge")
+@app.patch("/all_data_merge")
+async def api_all_data_merge_post(
+    request: Request,
+    limit: int = Query(15000, ge=1, le=100000),
+    offset: int = Query(0, ge=0),
+    table: str = Query(None)
+):
+    print(f"[DEBUG] api_all_data_merge_post called: limit={limit}, offset={offset}, table={table}")
+    max_size = 100 * 1024 * 1024
+    try:
+        body = await request.body()
+        if len(body) > max_size:
+            print("[DEBUG] api_all_data_merge_post: body too large")
+            raise HTTPException(status_code=413, detail="Payload too large (max 100 MB)")
+        data = await request.json()
+        if isinstance(data, list):
+            merged = data[offset:offset+limit]
+        elif isinstance(data, dict):
+            if 'data' in data and isinstance(data['data'], list):
+                merged = data['data'][offset:offset+limit]
+            else:
+                merged = [data][offset:offset+limit]
+        else:
+            merged = []
+        if not merged:
+            print("[DEBUG] api_all_data_merge_post: no data in body, fallback to local")
+            raise Exception("No data in body, fallback to local")
+        json_compatible = json.loads(json.dumps(merged, default=serialize_for_json))
+        return JSONResponse(content=json_compatible)
+    except Exception as e:
+        print(f"[all_data_merge_post][ERROR] {e}")
+        try:
+            merged = collect_tabular_data(DATA_DIR, only_table=table, include_progress=False, only_processed=True)
+            paged_data = merged[offset:offset+limit]
+            json_compatible = json.loads(json.dumps(paged_data, default=serialize_for_json))
+            return JSONResponse(content=json_compatible)
+        except Exception as e2:
+            print(f"[all_data_merge_post][HYBRID-FALLBACK] Fallback total failure: {e2}")
+            return JSONResponse(content=[])
+
+@app.get("/download_data")
+def download_data(table: str = Query(None, description="Nama table/data yang ingin diunduh (tanpa extensi)")):
+    print(f"[DEBUG] download_data called: table={table}")
+    file_path, file_name, media_type = get_first_parquet_file_path(DATA_DIR, table)
+    if not file_path or not os.path.exists(file_path):
+        print(f"[DEBUG] download_data: file not found")
+        raise HTTPException(status_code=404, detail="File data tidak ditemukan")
+    print(f"[DEBUG] download_data: sending file {file_path}")
+    return FileResponse(file_path, media_type=media_type, filename=file_name)
+
+# ========== AGENTIC PATCH FOR META PRUNE/REWRITE ==========
+
+def agentic_prune_meta(meta_path, data_dir, keep_status={"active", "changed", "new", "done"}):
+    if not os.path.exists(meta_path):
+        print(f"[AGENTIC][PRUNE][WARNING] Meta file {meta_path} tidak ditemukan.")
+        return {"status": "failed", "reason": f"Meta file {meta_path} tidak ditemukan."}
+    real_files = set(f.lower() for f in os.listdir(data_dir))
+    with open(meta_path, "r", encoding="utf-8") as f:
+        try:
+            meta = json.load(f)
+        except Exception as e:
+            print(f"[AGENTIC][PRUNE][ERROR] Gagal load meta: {e}")
+            return {"status": "failed", "reason": str(e)}
+    pruned_meta = []
+    seen = set()
+    for entry in meta:
+        fname = (entry.get("saved_name") or entry.get("name") or "").lower()
+        status = entry.get("status", "")
+        if fname.endswith('.parquet') and not fname.endswith('.parquet.meta.json'):
+            if status in keep_status and fname in real_files and fname not in seen:
+                pruned_meta.append(entry)
+                seen.add(fname)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(pruned_meta, f, indent=2, ensure_ascii=False)
+    print(f"[AGENTIC][PRUNE][REWRITE] Meta file pruned+rewrite: {meta_path} ({len(meta)} → {len(pruned_meta)} entry).")
+    return {
+        "status": "success",
+        "meta_path": meta_path,
+        "pruned_count": len(pruned_meta),
+        "original_count": len(meta)
+    }
+
+@app.post("/auto_batch_data")
+def auto_batch_data():
+    for meta_file in META_FILES:
+        agentic_prune_meta(meta_file, DATA_DIR)
+    pm.sync_progress()
+    files = get_files_with_total(pm)
+    total_records = sum(f["total"] for f in files)
+    all_processed = sum(f["processed"] for f in files)
+    batch_num = 1
+    results = []
+
+    if all_processed < total_records:
+        batch_quota = BATCH_SIZE
+        batch_detail = []
+        for f in files:
+            fname = f["name"]
+            meta = pm.get_file_progress(fname)
+            processed = meta.get("processed", 0)
+            total = meta.get("total", 0)
+            sisa = total - processed
+            if sisa <= 0:
+                continue
+            ambil_n = min(batch_quota, sisa)
+            if ambil_n > 0:
+                data = ambil_data(fname, processed, ambil_n)
+                pm.update_progress(
+                    file_name=fname,
+                    processed=processed + ambil_n,
+                    last_batch=batch_num,
+                    last_batch_size=ambil_n
+                )
+                batch_detail.append({
+                    "file": fname,
+                    "start": processed,
+                    "count": ambil_n,
+                    "end": processed + ambil_n
+                })
+                batch_quota -= ambil_n
+                all_processed += ambil_n
+            if batch_quota <= 0:
+                break
+        results.append({
+            "batch": batch_num,
+            "detail": batch_detail
+        })
+
+    return {
+        "message": f"Batch diproses.",
+        "progress": {f["name"]: pm.get_file_progress(f["name"]) for f in files},
+        "batches": results
+    }
+
+def get_file_info(file_path):
+    ext = os.path.splitext(file_path)[1].lower().lstrip('.')
+    size = 0
+    row_count = 0
+    data_row_start = 0
+    data_row_end = 0
+
+    try:
+        size = os.path.getsize(file_path)
+        if ext == 'parquet':
+            try:
+                df = pd.read_parquet(file_path)
+                row_count = len(df)
+                data_row_start = 1 if row_count > 0 else 0
+                data_row_end = row_count if row_count > 0 else 0
+            except Exception:
+                row_count = 0
+                data_row_start, data_row_end = 0, 0
+        else:
+            row_count = 0
+            data_row_start = 0
+            data_row_end = 0
+    except Exception as e:
+        size = 0
+        row_count = 0
+        data_row_start = 0
+        data_row_end = 0
+
+    return size, row_count, data_row_start, data_row_end, ext
+
+@app.get("/scan_data_folder_summary")
+def scan_data_folder_summary():
+    t0 = time.time()
+    file_list = []
+    for meta_file in META_FILES:
+        if not os.path.exists(meta_file):
+            continue
+        with open(meta_file, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        for m in meta:
+            fname = m.get("saved_name")
+            status = m.get("status", "")
+            if fname and status in ALLOWED_STATUS and fname.endswith('.parquet') and not fname.endswith('.parquet.meta.json'):
+                file_path = os.path.join(DATA_DIR, fname)
+                if os.path.isfile(file_path) and fname not in EXCLUDE_FILES:
+                    file_list.append(file_path)
+    summary = []
+    total_items = 0
+    total_size = 0
+    for file_path in file_list:
+        file_name = os.path.basename(file_path)
+        size, row_count, data_row_start, data_row_end, ext = get_file_info(file_path)
+        total_items += row_count
+        total_size += size
+        summary.append({
+            "file_name": file_name,
+            "file_path": file_path,
+            "file_type": ext,
+            "size_bytes": size,
+            "row_count": row_count,
+            "data_row_start": data_row_start,
+            "data_row_end": data_row_end
+        })
+    t1 = time.time()
+    return JSONResponse({
+        "total_items": total_items,
+        "total_files": len(summary),
+        "total_size_bytes": total_size,
+        "files": summary,
+        "folder_path": DATA_DIR,
+        "scan_duration_seconds": round(t1 - t0, 3),
+        "last_scan_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    })
+
+from pydantic import BaseModel
+from typing import Optional as TypingOptional, List as TypingList, Set as TypingSet
+
+class PruneRequest(BaseModel):
+    data_dir: str
+    meta_path: str
+    gdrive_names: TypingOptional[TypingList[str]] = None
+
+@app.post("/prune_agentic_meta")
+async def prune_agentic_meta_api(request: Request):
+    """
+    PATCH: Terima body apapun, fallback ke default jika field tidak ada atau body kosong.
+    Body: {"data_dir": "...", "meta_path": "...", "gdrive_names": [...] (optional)}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    data_dir = body.get("data_dir", DATA_DIR)
+    meta_path = body.get("meta_path", META_FILE)
+    gdrive_names = set(body.get("gdrive_names", [])) if "gdrive_names" in body else None
+    result = agentic_prune_meta(meta_path, data_dir, keep_status={"active", "changed", "new", "done"})
+    return result
+
+def cleanup_orphan_files(data_dir, meta_paths, exclude_files=None):
+    if exclude_files is None:
+        exclude_files = set()
+    else:
+        exclude_files = set(exclude_files)
+    if isinstance(meta_paths, str):
+        meta_paths = [meta_paths]
+    expected_files = set()
+    for meta_path in meta_paths:
+        if not os.path.exists(meta_path):
+            continue
+        with open(meta_path, "r", encoding="utf-8") as f:
+            try:
+                meta = json.load(f)
+                expected_files.update(m.get("saved_name") for m in meta if m.get("saved_name"))
+            except Exception as e:
+                print(f"[CLEANUP][ERROR] meta_path {meta_path}: {e}")
+    current_files = set(os.listdir(data_dir))
+    protected_files = expected_files | exclude_files
+    orphan_files = [f for f in current_files if f not in protected_files]
+    deleted = []
+    for f in orphan_files:
+        file_path = os.path.join(data_dir, f)
+        try:
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                os.remove(file_path)
+                deleted.append(f)
+                print(f"[CLEANUP] Deleted orphan file: {f}")
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)
+                deleted.append(f)
+                print(f"[CLEANUP] Deleted orphan folder: {f}")
+        except Exception as e:
+            print(f"[CLEANUP][ERROR] Failed to delete {f}: {e}")
+    return deleted
+
+@app.post("/cleanup_orphan_files")
+def cleanup_orphan_files_endpoint():
+    meta_paths = META_FILES
+    exclude = set(EXCLUDE_FILES)
+    for mp in meta_paths:
+        exclude.add(os.path.basename(mp))
+    deleted = cleanup_orphan_files(DATA_DIR, meta_paths, exclude_files=exclude)
+    return {"status": "success", "deleted_files": deleted}
+
+from upload_frontend_data import router as upload_router
+app.include_router(upload_router)
+
+from all_data_audit import router as audit_router
+app.include_router(audit_router)
+
+from universal_to_parquet_api import router as parquet_router
+app.include_router(parquet_router)
+
+if __name__ == "__main__":
+    import uvicorn
+    print("[DEBUG] __main__ starting uvicorn")
+    uvicorn.run("all_data_backend:app", host="0.0.0.0", port=8000, reload=True, workers=1)
